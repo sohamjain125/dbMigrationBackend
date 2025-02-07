@@ -1,0 +1,6 @@
+StudentID,FirstName,LastName,DateOfBirth,Email,PhoneNumber,GPA
+1006,Soham,Doe,5/15/1995,john.doe@email.com,123-456-7890,3.75
+1007,Ayush,Smith,8/22/1996,jane.smith@email.com,987-654-3210,3.92
+1003,Bob,Johnson,3/10/1994,bob.j@email.com,555-555-5555,3.45
+1004,Sarah,Williams,11/30/1997,sarah.w@email.com,444-444-4444,3.88
+1005,Soham,Brown,7/25/1995,mike.b@email.com,666-666-6666,3.67
