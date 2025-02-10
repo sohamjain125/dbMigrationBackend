@@ -175,15 +175,28 @@ function parseExcel(filePath) {
 //     }
 // }
 async function fetchReferenceData(tableName, keyColumn, valueColumn) {
-    const pool = await sql.connect(config);
-    const result = await pool.request()
-        .query(`SELECT ${keyColumn}, ${valueColumn} FROM ${tableName}`);
-    
-    // Create a mapping object { value: key }
-    return result.recordset.reduce((map, row) => {
-        map[row[valueColumn]] = row[keyColumn];
-        return map;
-    }, {});
+    try {
+        const pool = await sql.connect(config);
+        // For Departments table, we want to use DepartmentName instead of Name
+        const actualValueColumn = tableName === 'Departments' ? 'DepartmentName' : valueColumn;
+        
+        const query = `SELECT ${keyColumn}, ${actualValueColumn} FROM ${tableName}`;
+        console.log('Reference data query:', query); // Debug log
+        
+        const result = await pool.request().query(query);
+        
+        // Create a mapping object { value: key }
+        const mapping = result.recordset.reduce((map, row) => {
+            map[row[actualValueColumn]] = row[keyColumn];
+            return map;
+        }, {});
+        
+        console.log(`Reference mapping for ${tableName}:`, mapping); // Debug log
+        return mapping;
+    } catch (error) {
+        console.error(`Error fetching reference data for ${tableName}:`, error);
+        throw error;
+    }
 }
 
 async function migrateToSQL(data, tableName, mappings, customMappings = []) {
@@ -210,17 +223,28 @@ async function migrateToSQL(data, tableName, mappings, customMappings = []) {
             WHERE OBJECT_NAME(f.parent_object_id) = @tableName
         `;
 
+        // Get foreign key relationships
         const fkResult = await pool.request()
             .input('tableName', sql.VarChar, tableName)
-            .query(fkQuery);
+            .query(`
+                SELECT 
+                    COL_NAME(fc.parent_object_id, fc.parent_column_id) as ColumnName,
+                    OBJECT_NAME(f.referenced_object_id) as ReferencedTable,
+                    COL_NAME(fc.referenced_object_id, fc.referenced_column_id) as ReferencedColumn
+                FROM sys.foreign_keys AS f
+                INNER JOIN sys.foreign_key_columns AS fc
+                    ON f.object_id = fc.constraint_object_id
+                WHERE OBJECT_NAME(f.parent_object_id) = @tableName
+            `);
 
         // Create reference maps for all foreign keys
         const referenceMaps = {};
         for (const fk of fkResult.recordset) {
+            const valueColumn = fk.ReferencedTable === 'Departments' ? 'DepartmentName' : 'Name';
             referenceMaps[fk.ColumnName] = await fetchReferenceData(
                 fk.ReferencedTable,
                 fk.ReferencedColumn,
-                'Name'  // You might want to make this configurable
+                valueColumn
             );
         }
 
@@ -488,31 +512,133 @@ app.get('/api/tables', async (req, res) => {
     }
 });
 // Add this new endpoint to get column names for a specific table
+// app.get('/api/columns/:tableName', async (req, res) => {
+//     try {
+//         const pool = await sql.connect(config);
+//         const result = await pool.request()
+//             .input('tableName', sql.VarChar, req.params.tableName)
+//             .query(`
+//                 SELECT 
+//                     COLUMN_NAME,
+//                     DATA_TYPE,
+//                     CHARACTER_MAXIMUM_LENGTH
+//                 FROM INFORMATION_SCHEMA.COLUMNS
+//                 WHERE TABLE_NAME = @tableName
+//                 ORDER BY ORDINAL_POSITION
+//             `);
+
+//         res.json({
+//             success: true,
+//             columns: result.recordset.map(row => ({
+//                 name: row.COLUMN_NAME,
+//                 type: row.DATA_TYPE,
+//                 maxLength: row.CHARACTER_MAXIMUM_LENGTH
+//             }))
+//         });
+//     } catch (error) {
+//         console.error('Error fetching columns:', error);
+//         res.status(500).json({
+//             success: false,
+//             error: error.message
+//         });
+//     }
+// });
+
+// Add console.log to debug the metadata being returned
 app.get('/api/columns/:tableName', async (req, res) => {
     try {
         const pool = await sql.connect(config);
-        const result = await pool.request()
+        
+        // Get columns first
+        const columnsQuery = `
+            SELECT 
+                COLUMN_NAME as name,
+                DATA_TYPE as type,
+                CHARACTER_MAXIMUM_LENGTH as maxLength
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = @tableName
+            ORDER BY ORDINAL_POSITION
+        `;
+
+        const columnsResult = await pool.request()
+            .input('tableName', sql.VarChar, req.params.tableName)
+            .query(columnsQuery);
+
+        // Get foreign key information
+        const fkQuery = `
+            SELECT 
+                COL_NAME(fc.parent_object_id, fc.parent_column_id) as ColumnName,
+                OBJECT_NAME(f.referenced_object_id) as ReferencedTable,
+                COL_NAME(fc.referenced_object_id, fc.referenced_column_id) as ReferencedColumn
+            FROM sys.foreign_keys AS f
+            INNER JOIN sys.foreign_key_columns AS fc
+                ON f.object_id = fc.constraint_object_id
+            WHERE OBJECT_NAME(f.parent_object_id) = @tableName
+        `;
+
+        const fkResult = await pool.request()
+            .input('tableName', sql.VarChar, req.params.tableName)
+            .query(fkQuery);
+
+        // Create metadata object for ALL columns
+        const metadata = {};
+        
+        // First, set default metadata for all columns
+        columnsResult.recordset.forEach(col => {
+            metadata[col.name] = {
+                isForeignKey: false,
+                type: col.type,
+                maxLength: col.maxLength
+            };
+        });
+
+        // Then update foreign key information where applicable
+        fkResult.recordset.forEach(fk => {
+            metadata[fk.ColumnName] = {
+                ...metadata[fk.ColumnName],
+                isForeignKey: true,
+                referencedTable: fk.ReferencedTable,
+                referencedColumn: fk.ReferencedColumn
+            };
+        });
+
+        console.log('Final metadata:', metadata);
+
+        res.json({ 
+            success: true, 
+            columns: columnsResult.recordset,
+            metadata: metadata
+        });
+    } catch (error) {
+        console.error('Error:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+// Add this test endpoint
+app.get('/api/test-metadata/:tableName', async (req, res) => {
+    try {
+        const pool = await sql.connect(config);
+        const fkResult = await pool.request()
             .input('tableName', sql.VarChar, req.params.tableName)
             .query(`
                 SELECT 
-                    COLUMN_NAME,
-                    DATA_TYPE,
-                    CHARACTER_MAXIMUM_LENGTH
-                FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_NAME = @tableName
-                ORDER BY ORDINAL_POSITION
+                    COL_NAME(fc.parent_object_id, fc.parent_column_id) as ColumnName,
+                    OBJECT_NAME(f.referenced_object_id) as ReferencedTable,
+                    COL_NAME(fc.referenced_object_id, fc.referenced_column_id) as ReferencedColumn
+                FROM sys.foreign_keys AS f
+                INNER JOIN sys.foreign_key_columns AS fc
+                    ON f.object_id = fc.constraint_object_id
+                WHERE OBJECT_NAME(f.parent_object_id) = @tableName
             `);
 
         res.json({
             success: true,
-            columns: result.recordset.map(row => ({
-                name: row.COLUMN_NAME,
-                type: row.DATA_TYPE,
-                maxLength: row.CHARACTER_MAXIMUM_LENGTH
-            }))
+            foreignKeys: fkResult.recordset
         });
     } catch (error) {
-        console.error('Error fetching columns:', error);
         res.status(500).json({
             success: false,
             error: error.message
