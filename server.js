@@ -55,125 +55,7 @@ function parseExcel(filePath) {
     return xlsx.utils.sheet_to_json(workbook.Sheets[sheetName]);
 }
 
-// Migrate data to SQL Server
-// async function migrateToSQL(data, tableName, mappings) {
-//     let pool;
-//     try {
-//         pool = await sql.connect(config);
 
-//         // Debug logs
-//         console.log('Data received:', data);
-//         console.log('Mappings received:', mappings);
-
-//         for (let rowIndex = 0; rowIndex < data.length; rowIndex++) {
-//             const row = data[rowIndex];
-//             const columns = Object.keys(mappings);
-
-//             // Debug log for each row
-//             console.log('Processing row:', row);
-//             console.log('Available columns:', columns);
-
-//             // Get values using the correct mapping
-//             const values = columns.map(sqlCol => {
-//                 const fileCol = mappings[sqlCol];
-//                 const value = row[fileCol];
-//                 console.log(`Mapping ${fileCol} -> ${sqlCol}, Value:`, value);
-//                 return value;
-//             });
-
-//             const paramNames = columns.map((_, index) => `@p${rowIndex}_${index}`);
-
-//             const query = `
-//                 INSERT INTO ${tableName} (${columns.join(', ')})
-//                 VALUES (${paramNames.join(', ')})
-//             `;
-
-//             console.log('Executing query:', query);
-
-//             const request = pool.request();
-
-//             columns.forEach((col, index) => {
-//                 request.input(`p${rowIndex}_${index}`, values[index]);
-//             });
-
-//             await request.query(query);
-//         }
-
-//         return true;
-//     } catch (error) {
-//         console.error('Migration Error:', error);
-//         console.error('Error details:', {
-//             data: data,
-//             mappings: mappings,
-//             tableName: tableName
-//         });
-//         throw error;
-//     } finally {
-//         if (pool) {
-//             await pool.close();
-//         }
-//     }
-// }
-// async function migrateToSQL(data, tableName, mappings, customMappings = []) {
-//     let pool;
-//     try {
-//         pool = await sql.connect(config);
-
-//         for (let rowIndex = 0; rowIndex < data.length; rowIndex++) {
-//             let row = data[rowIndex];
-
-//             // Process custom mappings first
-//             for (const customMapping of customMappings) {
-//                 if (customMapping.type === 'concat') {
-//                     // Combine fields
-//                     const combinedValue = customMapping.sourceFields
-//                         .map(field => row[field])
-//                         .join(customMapping.separator);
-//                     row[customMapping.destinationField] = combinedValue;
-//                 } else if (customMapping.type === 'split') {
-//                     // Split field
-//                     const parts = row[customMapping.sourceFields[0]]?.split(customMapping.separator) || [];
-//                     if (Array.isArray(customMapping.destinationField)) {
-//                         customMapping.destinationField.forEach((field, index) => {
-//                             row[field] = parts[index] || '';
-//                         });
-//                     }
-//                 }
-//             }
-
-//             const columns = Object.keys(mappings);
-//             const values = columns.map(sqlCol => row[mappings[sqlCol]]);
-
-//             // Validate data before insert
-//             if (values.some(v => v === undefined)) {
-//                 console.warn(`Warning: Row ${rowIndex + 1} has undefined values`);
-//                 continue; // Skip this row
-//             }
-
-//             const paramNames = columns.map((_, index) => `@p${rowIndex}_${index}`);
-//             const query = `
-//                 INSERT INTO ${tableName} (${columns.join(', ')})
-//                 VALUES (${paramNames.join(', ')})
-//             `;
-
-//             const request = pool.request();
-//             columns.forEach((col, index) => {
-//                 request.input(`p${rowIndex}_${index}`, values[index]);
-//             });
-
-//             await request.query(query);
-//         }
-
-//         return true;
-//     } catch (error) {
-//         console.error('Migration Error:', error);
-//         throw error;
-//     } finally {
-//         if (pool) {
-//             await pool.close();
-//         }
-//     }
-// }
 async function fetchReferenceData(tableName, keyColumn, valueColumn) {
     try {
         const pool = await sql.connect(config);
@@ -346,7 +228,88 @@ async function migrateToSQL(data, tableName, mappings, customMappings = []) {
 
 
 
-// Handle file upload and migration
+
+app.post('/api/validate', async (req, res) => {
+    try {
+        const { data, mappings, tableName } = req.body;
+        const pool = await sql.connect(config);
+
+        // Get reference data for foreign keys
+        const fkResult = await pool.request()
+            .input('tableName', sql.VarChar, tableName)
+            .query(`
+                SELECT 
+                    COL_NAME(fc.parent_object_id, fc.parent_column_id) as ColumnName,
+                    OBJECT_NAME(f.referenced_object_id) as ReferencedTable,
+                    COL_NAME(fc.referenced_object_id, fc.referenced_column_id) as ReferencedColumn
+                FROM sys.foreign_keys AS f
+                INNER JOIN sys.foreign_key_columns AS fc
+                    ON f.object_id = fc.constraint_object_id
+                WHERE OBJECT_NAME(f.parent_object_id) = @tableName
+            `);
+
+        // Get reference data
+        const validationResults = [];
+        const referenceMaps = {};
+
+        // Build reference maps
+        for (const fk of fkResult.recordset) {
+            const valueColumn = fk.ReferencedTable === 'Departments' ? 'DepartmentName' : 'Name';
+            referenceMaps[fk.ColumnName] = await fetchReferenceData(
+                fk.ReferencedTable,
+                fk.ReferencedColumn,
+                valueColumn
+            );
+        }
+
+        // Validate each record
+        for (const record of data) {
+            const errors = [];
+            
+            // Check for required fields
+            Object.entries(mappings).forEach(([sqlCol, fileCol]) => {
+                if (!record[fileCol] || record[fileCol].trim() === '') {
+                    errors.push(`Missing required value for ${sqlCol}`);
+                }
+            });
+
+            // Check foreign key values
+            for (const fk of fkResult.recordset) {
+                const sourceValue = record[mappings[fk.ColumnName]];
+                if (sourceValue && !referenceMaps[fk.ColumnName][sourceValue]) {
+                    errors.push(`Invalid ${fk.ColumnName}: ${sourceValue} not found in ${fk.ReferencedTable}`);
+                }
+            }
+
+            validationResults.push({
+                record,
+                isValid: errors.length === 0,
+                errors
+            });
+        }
+
+        // Calculate summary
+        const summary = {
+            totalRecords: data.length,
+            validRecords: validationResults.filter(r => r.isValid).length,
+            invalidRecords: validationResults.filter(r => !r.isValid).length,
+            details: validationResults
+        };
+
+        res.json({
+            success: true,
+            validation: summary
+        });
+
+    } catch (error) {
+        console.error('Validation Error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // app.post('/api/migrate', upload.single('file'), async (req, res) => {
 //     try {
 //         if (!req.file) {
@@ -357,7 +320,6 @@ async function migrateToSQL(data, tableName, mappings, customMappings = []) {
 //         const mappings = JSON.parse(req.body.mappings);
 //         const customMappings = JSON.parse(req.body.customMappings || '[]');
 
-//         // Validate required fields
 //         if (!tableName || !mappings || Object.keys(mappings).length === 0) {
 //             throw new Error('Missing required fields');
 //         }
@@ -365,7 +327,6 @@ async function migrateToSQL(data, tableName, mappings, customMappings = []) {
 //         let data = [];
 //         const fileType = req.file.originalname.split('.').pop().toLowerCase();
 
-//         // Parse file based on type
 //         if (fileType === 'csv') {
 //             data = await parseCSV(req.file.path);
 //         } else if (['xlsx', 'xls'].includes(fileType)) {
@@ -374,26 +335,32 @@ async function migrateToSQL(data, tableName, mappings, customMappings = []) {
 //             throw new Error('Unsupported file type');
 //         }
 
-//         // Migrate data with custom mappings
-//         await migrateToSQL(data, tableName, mappings, customMappings);
+//         // Migrate data and get statistics
+//         const stats = await migrateToSQL(data, tableName, mappings, customMappings);
 
 //         // Clean up uploaded file
 //         fs.unlinkSync(req.file.path);
 
-//         res.json({ 
-//             success: true, 
-//             message: `Migrated ${data.length} records successfully` 
+//         res.json({
+//             success: true,
+//             message: 'Migration completed',
+//             totalRecords: stats.total,
+//             processedRecords: stats.processed,
+//             skippedRecords: stats.skipped,
+//             failedRecords: stats.failed
 //         });
 
 //     } catch (error) {
 //         console.error('API Error:', error);
-//         res.status(500).json({ 
-//             success: false, 
+//         res.status(500).json({
+//             success: false,
 //             error: error.message,
 //             details: process.env.NODE_ENV === 'development' ? error.stack : undefined
 //         });
 //     }
 // });
+
+// Add endpoint to get reference data
 
 app.post('/api/migrate', upload.single('file'), async (req, res) => {
     try {
@@ -420,8 +387,108 @@ app.post('/api/migrate', upload.single('file'), async (req, res) => {
             throw new Error('Unsupported file type');
         }
 
-        // Migrate data and get statistics
-        const stats = await migrateToSQL(data, tableName, mappings, customMappings);
+        // Initialize migration results
+        const migrationResults = {
+            total: data.length,
+            processed: 0,
+            skipped: 0,
+            failed: 0,
+            details: []
+        };
+
+        // Process each record
+        for (let i = 0; i < data.length; i++) {
+            const record = data[i];
+            try {
+                const pool = await sql.connect(config);
+                
+                // First check if record already exists
+                const checkQuery = `
+                    SELECT 1 FROM ${tableName} 
+                    WHERE EmployeeId = @employeeId
+                `;
+                
+                const checkResult = await pool.request()
+                    .input('employeeId', sql.VarChar, record.EmployeeId)
+                    .query(checkQuery);
+
+                if (checkResult.recordset.length > 0) {
+                    // Record exists - mark as skipped
+                    migrationResults.skipped++;
+                    migrationResults.details.push({
+                        status: 'skipped',
+                        record: record,
+                        message: `Record with EmployeeId ${record.EmployeeId} already exists`
+                    });
+                    continue;
+                }
+
+                // Check if department exists
+                const deptCheckQuery = `
+                    SELECT 1 FROM Departments 
+                    WHERE DepartmentName = @deptName
+                `;
+                
+                const deptResult = await pool.request()
+                    .input('deptName', sql.VarChar, record.DepartmentName)
+                    .query(deptCheckQuery);
+
+                if (deptResult.recordset.length === 0) {
+                    // Department doesn't exist - mark as failed
+                    migrationResults.failed++;
+                    migrationResults.details.push({
+                        status: 'failed',
+                        record: record,
+                        message: `Invalid department: ${record.DepartmentName}`
+                    });
+                    continue;
+                }
+
+                // Process and insert the record
+                const processedRecord = await processRecordWithForeignKeys(record, tableName, mappings);
+                const columns = Object.keys(mappings);
+                const values = columns.map(col => `@${col}`);
+                
+                const insertQuery = `
+                    INSERT INTO ${tableName} (${columns.join(', ')})
+                    VALUES (${values.join(', ')})
+                `;
+
+                const request = pool.request();
+                columns.forEach(col => {
+                    request.input(col, processedRecord[mappings[col]]);
+                });
+
+                await request.query(insertQuery);
+                
+                // Record successful insertion
+                migrationResults.processed++;
+                migrationResults.details.push({
+                    status: 'success',
+                    record: record,
+                    message: 'Successfully migrated'
+                });
+
+            } catch (error) {
+                // Handle duplicate record error
+                if (error.number === 2627 || error.number === 2601) {
+                    migrationResults.skipped++;
+                    migrationResults.details.push({
+                        status: 'skipped',
+                        record: record,
+                        message: 'Duplicate record'
+                    });
+                } else {
+                    // Handle other errors
+                    migrationResults.failed++;
+                    migrationResults.details.push({
+                        status: 'failed',
+                        record: record,
+                        message: error.message
+                    });
+                }
+            }
+        }
 
         // Clean up uploaded file
         fs.unlinkSync(req.file.path);
@@ -429,11 +496,9 @@ app.post('/api/migrate', upload.single('file'), async (req, res) => {
         res.json({
             success: true,
             message: 'Migration completed',
-            totalRecords: stats.total,
-            processedRecords: stats.processed,
-            skippedRecords: stats.skipped,
-            failedRecords: stats.failed
+            results: migrationResults
         });
+        console.log(migrationResults);
 
     } catch (error) {
         console.error('API Error:', error);
@@ -445,7 +510,89 @@ app.post('/api/migrate', upload.single('file'), async (req, res) => {
     }
 });
 
-// Add endpoint to get reference data
+// Add this helper function to process individual records
+async function processSingleRecord(record, tableName, mappings, customMappings) {
+    const pool = await sql.connect(config);
+    
+    // Check for existing record
+    const checkQuery = `SELECT 1 FROM ${tableName} WHERE ${Object.keys(mappings)[0]} = @id`;
+    const checkResult = await pool.request()
+        .input('id', sql.VarChar, record[mappings[Object.keys(mappings)[0]]])
+        .query(checkQuery);
+
+    if (checkResult.recordset.length > 0) {
+        return { status: 'skipped', message: 'Record already exists' };
+    }
+
+    // Process foreign key mappings
+    const processedRecord = await processRecordWithForeignKeys(record, tableName, mappings);
+
+    // Insert the record
+    const columns = Object.keys(mappings);
+    const values = columns.map(col => `@${col}`);
+    
+    const insertQuery = `
+        INSERT INTO ${tableName} (${columns.join(', ')})
+        VALUES (${values.join(', ')})
+    `;
+
+    const request = pool.request();
+    columns.forEach(col => {
+        request.input(col, processedRecord[mappings[col]]);
+    });
+
+    await request.query(insertQuery);
+    return { status: 'success' };
+}
+
+// Add this helper function to process foreign keys
+async function processRecordWithForeignKeys(record, tableName, mappings) {
+    const pool = await sql.connect(config);
+    const processedRecord = { ...record };
+
+    // Get foreign key information
+    const fkQuery = `
+        SELECT 
+            COL_NAME(fc.parent_object_id, fc.parent_column_id) as ColumnName,
+            OBJECT_NAME(f.referenced_object_id) as ReferencedTable,
+            COL_NAME(fc.referenced_object_id, fc.referenced_column_id) as ReferencedColumn
+        FROM sys.foreign_keys AS f
+        INNER JOIN sys.foreign_key_columns AS fc
+            ON f.object_id = fc.constraint_object_id
+        WHERE OBJECT_NAME(f.parent_object_id) = @tableName
+    `;
+
+    const fkResult = await pool.request()
+        .input('tableName', sql.VarChar, tableName)
+        .query(fkQuery);
+
+    // Process each foreign key
+    for (const fk of fkResult.recordset) {
+        const sourceValue = record[mappings[fk.ColumnName]];
+        if (sourceValue) {
+            const lookupQuery = `
+                SELECT ${fk.ReferencedColumn}
+                FROM ${fk.ReferencedTable}
+                WHERE DepartmentName = @value
+            `;
+
+            const lookupResult = await pool.request()
+                .input('value', sql.VarChar, sourceValue)
+                .query(lookupQuery);
+
+            if (lookupResult.recordset.length === 0) {
+                throw new Error(`Referenced value not found: ${sourceValue} in ${fk.ReferencedTable}`);
+            }
+
+            processedRecord[mappings[fk.ColumnName]] = lookupResult.recordset[0][fk.ReferencedColumn];
+        }
+    }
+
+    return processedRecord;
+}
+
+
+
 app.get('/api/reference/:tableName', async (req, res) => {
     try {
         const { tableName } = req.params;
